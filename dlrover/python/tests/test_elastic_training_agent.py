@@ -70,7 +70,7 @@ class ElasticTrainingAgentTest(unittest.TestCase):
     def setUp(self) -> None:
         _set_paral_config()
         self._master, addr = start_local_master()
-        MasterClient._instance = build_master_client(addr, 0.5)
+        MasterClient._instance = build_master_client(addr, 3)
         launch_config = LaunchConfig(
             min_nodes=2,
             max_nodes=2,
@@ -181,6 +181,7 @@ class ElasticTrainingAgentTest(unittest.TestCase):
             start_method=self.config.start_method,
             log_dir=self.config.log_dir,
         )
+
         # Mock node rank 0 joins the rendezvous.
         self.rdzv_handler._client._node_id = 0
         self.rdzv_handler._client.join_rendezvous(
@@ -188,18 +189,12 @@ class ElasticTrainingAgentTest(unittest.TestCase):
         )
 
         store = self.rdzv_handler._get_store(round=1, group=0)
-
-        def _set_store(store):
-            time.sleep(5)
-            store.set("MASTER_ADDR", "127.0.0.1".encode())
-            store.set("MASTER_PORT", "12345".encode())
-
-        _task = threading.Thread(target=_set_store, args=(store,))
-        _task.start()
+        store.set("MASTER_ADDR", "127.0.0.1".encode())
+        store.set("MASTER_PORT", "54321".encode())
 
         addr, port = agent._safe_get_master_addr_port(store)
         self.assertEqual(addr, "127.0.0.1")
-        self.assertEqual(port, 12345)
+        self.assertEqual(port, 54321)
 
         # Set the node id and rank as 1.
         agent._client._node_id = 1
@@ -214,7 +209,7 @@ class ElasticTrainingAgentTest(unittest.TestCase):
         self.assertEqual(worker.global_rank, 9)
         self.assertEqual(worker.world_size, 16)
         self.assertEqual(store.get("MASTER_ADDR").decode(), "127.0.0.1")
-        self.assertEqual(store.get("MASTER_PORT").decode(), "12345")
+        self.assertEqual(store.get("MASTER_PORT").decode(), "54321")
 
     def test_get_local_ip(self):
         local_ip = _get_local_ip()
@@ -325,19 +320,23 @@ class ElasticTrainingAgentRunTest(unittest.TestCase):
         self.assertEqual(run_result.state, WorkerState.SUCCEEDED)
 
     def test_report_resource_with_step(self):
-        os.environ[NodeEnv.MONITOR_ENABLED] = "true"
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            config_file = os.path.join(tmpdirname, "runtime_metrics.json")
-            monitor = TorchTrainingMonitor(config_file)
-            monitor.start()
-            monitor.report_resource_with_step()
-            self.assertEqual(self._master.speed_monitor._global_step, 0)
-            record = {"step": 100, "timestamp": time.time()}
-            with open(config_file, "w") as f:
-                f.write(json.dumps(record))
+        mock_env = {
+            NodeEnv.MONITOR_ENABLED: "true",
+        }
 
-            monitor.report_resource_with_step()
-            self.assertEqual(self._master.speed_monitor._global_step, 100)
+        with patch.dict("os.environ", mock_env):
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                config_file = os.path.join(tmpdirname, "runtime_metrics.json")
+                monitor = TorchTrainingMonitor(config_file)
+                monitor.start()
+                monitor.report_resource_with_step()
+                self.assertEqual(self._master.speed_monitor._global_step, 0)
+                record = {"step": 100, "timestamp": time.time()}
+                with open(config_file, "w") as f:
+                    f.write(json.dumps(record))
+
+                monitor.report_resource_with_step()
+                self.assertEqual(self._master.speed_monitor._global_step, 100)
 
     def test_check_network_rdzv_for_elastic_training(self):
         self._master.rdzv_managers[
@@ -753,6 +752,106 @@ class MasterRendezvousHandlerTest(unittest.TestCase):
         )
         with self.assertRaises(TimeoutError):
             rdzv_handler.next_rendezvous()
+
+
+class ElasticTrainingAgentDiagTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._master, addr = start_local_master()
+        MasterClient._instance = build_master_client(addr, 1)
+        launch_config = LaunchConfig(
+            min_nodes=1,
+            max_nodes=1,
+            nproc_per_node=2,
+            run_id="test",
+            monitor_interval=0.1,
+        )
+        self.config = ElasticLaunchConfig(**launch_config.__dict__)
+        self.config.training_log_file = "/tmp/dlrover.log"
+        self.config.step_rank = -1
+        self.config.step_pattern = (
+            r"^\s+\[(\d{4}\-\d{2}\-\d{2} \d{2}:"
+            r"\d{2}:\d{2})\]\s+iteration\s+(\d+)\/\s+(\d+)\s+\|"
+        )
+
+        rdzv_parameters = RendezvousParameters(
+            backend=self.config.rdzv_backend,
+            endpoint=self.config.rdzv_endpoint,
+            run_id=self.config.run_id,
+            min_nodes=self.config.min_nodes,
+            max_nodes=self.config.max_nodes,
+            local_addr=self.config.local_addr,
+            **self.config.rdzv_configs,
+        )
+
+        master_addr = "127.0.0.1"
+        node_id = 0
+
+        self.rdzv_handler = MasterRendezvousHandler(
+            RendezvousName.ELASTIC_TRAINING,
+            node_id,
+            rdzv_parameters,
+            local_world_size=self.config.nproc_per_node,
+        )
+        self.rdzv_handler.join_timeout = 5
+
+        self.spec = WorkerSpec(
+            role=self.config.role,
+            local_world_size=self.config.nproc_per_node,
+            entrypoint="echo",
+            args=tuple([]),
+            rdzv_handler=self.rdzv_handler,
+            max_restarts=self.config.max_restarts,
+            monitor_interval=self.config.monitor_interval,
+            master_addr=master_addr,
+            local_addr=self.config.local_addr,
+        )
+
+    def tearDown(self):
+        self._master.stop()
+
+    def test_step_collect(self):
+        mock_env = {
+            NodeEnv.MONITOR_ENABLED: "true",
+        }
+        with patch.dict("os.environ", mock_env):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                _logfile = os.path.join(tmpdir, "dlrover.log")
+
+                _monitor = TorchTrainingMonitor(
+                    ConfigPath.RUNTIME_METRICS,
+                    logfile=_logfile,
+                    match_pattern=self.config.step_pattern,
+                    step_rank=0,
+                )
+                _monitor.stop_step_collector = True
+
+                with open(_logfile, "w") as f:
+                    f.write(
+                        " [2024-11-19 12:02:43] iteration    82082/ 1000000 |"
+                        " consumed samples:    386113728 |"
+                        " elapsed time per iteration (ms): 39653.4 |"
+                    )
+                _monitor.do_user_step_collect(
+                    _logfile, self.config.step_pattern
+                )
+                _monitor.stop()
+
+                time.sleep(3)
+                self.assertEqual(
+                    self._master.speed_monitor.first_step_time, 1732017763
+                )
+                self.assertEqual(
+                    self._master.speed_monitor.user_step_records[0].step_num,
+                    82082,
+                )
+                self.assertEqual(
+                    self._master.speed_monitor.user_step_records[0].total_step,
+                    1000_000,
+                )
+                self.assertEqual(
+                    self._master.speed_monitor.user_step_records[0].timestamp,
+                    1732017763,
+                )
 
 
 if __name__ == "__main__":
