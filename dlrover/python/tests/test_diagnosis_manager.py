@@ -27,6 +27,7 @@ from dlrover.python.common.constants import (
 from dlrover.python.common.global_context import Context
 from dlrover.python.common.metric.context import JobMetricContext
 from dlrover.python.common.metric.metric import GpuMetric, GpuNodeMetric
+from dlrover.python.common.node import Node
 from dlrover.python.diagnosis.common.constants import (
     DiagnosisActionType,
     DiagnosisDataType,
@@ -34,6 +35,7 @@ from dlrover.python.diagnosis.common.constants import (
 )
 from dlrover.python.diagnosis.common.diagnosis_action import (
     DiagnosisAction,
+    NoAction,
     NodeAction,
 )
 from dlrover.python.diagnosis.common.diagnosis_data import (
@@ -196,9 +198,13 @@ class DiagnosisManagerTest(unittest.TestCase):
         mgr.pre_check()
         self.assertEqual(job_context._action_queue.len(), 0)
 
+        _dlrover_context = Context.singleton_instance()
+        _dlrover_context.pre_check_operators = [
+            ("dlrover.python.tests.test_diagnosis_manager", "TestOperator")
+        ]
         mgr.get_pre_check_operators = MagicMock(return_value=[TestOperator()])
         mgr.pre_check()
-        self.assertTrue(isinstance(job_context.next_action(1), NodeAction))
+        self.assertTrue(isinstance(job_context.next_action(), NodeAction))
 
 
 class TestOperator(PreCheckOperator):
@@ -210,16 +216,19 @@ class TestOperator(PreCheckOperator):
     def get_retry_times(cls) -> int:
         return 1
 
-    def check(self) -> PreCheckResult:
-        return PreCheckResult(1, "test", [1])
+    def check(self, *args, **kwargs) -> PreCheckResult:
+        return PreCheckResult(1, "test", [Node("worker", 0)])
 
-    def recover(self):
-        pass
+    def recover_actions(self, *args, **kwargs) -> List[DiagnosisAction]:
+        return [
+            NodeAction(
+                node_id=1,
+                node_type="worker",
+                node_status=NodeStatus.FAILED,
+                reason="hang",
+                action_type=DiagnosisActionType.MASTER_RELAUNCH_WORKER,
+            )
+        ]
 
-    def get_failed_action(self) -> DiagnosisAction:
-        return NodeAction(
-            node_id=1,
-            node_status=NodeStatus.FAILED,
-            reason="hang",
-            action_type=DiagnosisActionType.MASTER_RELAUNCH_WORKER,
-        )
+    def failed_actions(self, *args, **kwargs) -> List[DiagnosisAction]:
+        return [NoAction()]

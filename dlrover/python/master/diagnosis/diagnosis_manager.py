@@ -53,9 +53,6 @@ from dlrover.python.master.diagnosis.diagnosis import Diagnostician
 from dlrover.python.master.diagnosis.diagnosis_data_manager import (
     DiagnosisDataManager,
 )
-from dlrover.python.master.diagnosis.precheck_operator import (
-    NoPreCheckOperator,
-)
 from dlrover.python.master.node.job_context import get_job_context
 
 _metric_context = JobMetricContext.singleton_instance()
@@ -77,10 +74,6 @@ class DiagnosisManager:
         self._metric_monitor = None
         self._lock = threading.Lock()
 
-    @classmethod
-    def get_pre_check_operators(cls):
-        return [NoPreCheckOperator()]
-
     def collect_diagnosis_data(self, data: DiagnosisData):
         self._data_manager.store_data(data)
 
@@ -89,7 +82,7 @@ class DiagnosisManager:
             return
 
         start = time.time()
-        pre_check_ops = self.get_pre_check_operators()
+        pre_check_ops = _dlrover_context.get_pre_check_operators()
         logger.info(
             "Start to training pre-check with "
             f"operators: {[op.__class__.__name__ for op in pre_check_ops]}."
@@ -116,7 +109,12 @@ class DiagnosisManager:
 
                     if not current_op_result.is_success():
                         # try recover and wait
-                        pre_check_op.recover()
+                        actions = pre_check_op.recover_actions()
+                        self._job_context.enqueue_actions(actions)
+                        logger.info(
+                            f"{pre_check_op_name} try recovering "
+                            f"by actions: {actions}"
+                        )
                         time.sleep(pre_check_op.get_retry_interval_secs())
 
                         # check again after recover
@@ -128,14 +126,14 @@ class DiagnosisManager:
                 continue
 
             if not current_op_result.is_success():
-                action = pre_check_op.get_failed_action()
-                self._job_context.enqueue_action(action)
+                actions = pre_check_op.failed_actions()
+                self._job_context.enqueue_actions(actions)
                 logger.warning(
                     "Training pre-check failed "
                     f"by {pre_check_op_name} "
                     f"with result: {current_op_result}, "
                     f"cost:{time.time()-current_start:.2f}ms. "
-                    f"Invoke action: {action}."
+                    f"Invoke action: {actions}."
                 )
                 self._job_context.set_pre_check_status(PreCheckStatus.FAIL)
                 return
