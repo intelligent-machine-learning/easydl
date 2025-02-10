@@ -343,3 +343,5 @@ class DiagnosisManager:
             time.sleep(
                 DiagnosisConstant.MASTER_DIAGNOSIS_OBSERVING_INTERVAL_SECS
             )
+
+    def diagnosis(self, operators: I):
